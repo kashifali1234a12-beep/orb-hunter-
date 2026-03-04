@@ -1,0 +1,573 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// ICT iFVG CONTINUATION ENGINE v5.1 — PHANTOM FIX + GERTI SL/TP
+// ═══════════════════════════════════════════════════════════════════════════════
+// v5.1 Critical Fixes:
+//   FIX 1: Native 1m FVG invalidation — phantom FVGs that get filled naturally
+//          are cleared AFTER the FSM has its chance to trigger. Prevents stale
+//          levels from misfiring bars or days later.
+//   FIX 2: Zone Burn bug — htfTraded[] and armed state consumption now ONLY
+//          fires inside `if shortCondition` / `if longCondition` blocks.
+//          A 15m zone is NEVER locked out unless a physical order is sent.
+//   FIX 3: Gerti SL/TP — SL at the absolute swing extreme of the pullback
+//          leg (default 10-bar lookback), TP at entry ± (SL_dist × R:R).
+//
+// Order of Operations (per bar):
+//   S3: HTF FVG detection
+//   S4: HTF invalidation
+//   S5: 1m FVG detection (draw boxes)
+//   S6: Armed state (tap detection)
+//   S7: Inversion trigger + execution (consumption ONLY if condition = true)
+//   S8: Native FVG cleanup (AFTER S7 so FSM fires first)
+//   S9: Trade management (SL/TP orders)
+// ═══════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy("ICT iFVG Continuation Engine v5.1",
+     overlay        = true,
+     margin_long    = 100,
+     margin_short   = 100,
+     calc_on_every_tick  = false,
+     process_orders_on_close = true,
+     max_bars_back  = 5000,
+     max_boxes_count = 500,
+     max_labels_count = 500,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1: USER INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+string  GRP_TIME    = "═══ Time Window ═══"
+string  i_session   = input.session("0930-1545", "Trading Hours (EST)", group=GRP_TIME,
+                         tooltip="Only takes trades during this window. HHMM-HHMM in EST.")
+
+string  GRP_TF      = "═══ Timeframes ═══"
+string  i_htfTF     = input.timeframe("15", "Higher Timeframe for FVGs", group=GRP_TF)
+
+string  GRP_RISK    = "═══ Risk Management ═══"
+float   i_rrRatio   = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.25, group=GRP_RISK)
+int     i_slLookback = input.int(10, "SL Swing Lookback (bars)", minval=3, maxval=30, group=GRP_RISK,
+                         tooltip="Bars to scan for the absolute peak/valley of the pullback leg. Gerti default: 10.")
+int     i_minSLTicks = input.int(10, "SL Buffer (ticks beyond swing)", minval=1, maxval=50, group=GRP_RISK,
+                         tooltip="Ticks added beyond the swing extreme. Also serves as fail-safe minimum SL distance.")
+
+string  GRP_FILT    = "═══ Filters ═══"
+int     i_maxTrades = input.int(3, "Max Trades Per Day", minval=1, maxval=10, group=GRP_FILT)
+int     i_maxHTF    = input.int(10, "Max Active HTF FVGs Tracked", minval=3, maxval=30, group=GRP_FILT)
+bool    i_reqSweep  = input.bool(false, "Require Liquidity Sweep", group=GRP_FILT,
+                         tooltip="If checked, price MUST sweep outside the 15m zone boundary before the iFVG can trigger.")
+
+string  GRP_VIS     = "═══ Visuals ═══"
+bool    i_showHTF   = input.bool(true, "Show 15m FVG Boxes", group=GRP_VIS)
+bool    i_showLTF   = input.bool(true, "Show 1m FVG Boxes", group=GRP_VIS)
+bool    i_showSigs  = input.bool(true, "Show Entry Signals", group=GRP_VIS)
+bool    i_showArm   = input.bool(true, "Show Armed State Background", group=GRP_VIS)
+bool    i_showSLTP  = input.bool(true, "Show SL/TP Labels", group=GRP_VIS)
+color   i_bullHTF   = input.color(color.new(color.teal, 85), "Bullish 15m FVG Color", group=GRP_VIS)
+color   i_bearHTF   = input.color(color.new(color.red, 85), "Bearish 15m FVG Color", group=GRP_VIS)
+color   i_bullLTF   = input.color(color.new(color.green, 80), "Bullish 1m FVG Color", group=GRP_VIS)
+color   i_bearLTF   = input.color(color.new(color.red, 78), "Bearish 1m FVG Color", group=GRP_VIS)
+color   i_invertClr = input.color(color.new(color.purple, 70), "Inverted iFVG Color", group=GRP_VIS)
+color   i_filledClr = input.color(color.new(color.gray, 85), "Filled/Dead FVG Color", group=GRP_VIS)
+color   i_tradedClr = input.color(color.new(color.gray, 80), "Traded 15m Zone Color", group=GRP_VIS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2: SESSION & DAILY TRADE COUNT
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool inSession = not na(time(timeframe.period, i_session, "America/New_York"))
+
+var int dailyTradeCount = 0
+bool isNewDay = ta.change(time("D", "", "America/New_York")) != 0
+if isNewDay
+    dailyTradeCount := 0
+
+bool canTrade = inSession and (dailyTradeCount < i_maxTrades) and strategy.position_size == 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3: ENGINE 1 — MTF 15-MINUTE FVG ARRAY TRACKER + htfTraded[]
+// ─────────────────────────────────────────────────────────────────────────────
+
+float htfHigh  = request.security(syminfo.tickerid, i_htfTF, high[1],  barmerge.gaps_off, barmerge.lookahead_on)
+float htfLow   = request.security(syminfo.tickerid, i_htfTF, low[1],   barmerge.gaps_off, barmerge.lookahead_on)
+float htfClose = request.security(syminfo.tickerid, i_htfTF, close[1], barmerge.gaps_off, barmerge.lookahead_on)
+float htfHigh3 = request.security(syminfo.tickerid, i_htfTF, high[3],  barmerge.gaps_off, barmerge.lookahead_on)
+float htfLow3  = request.security(syminfo.tickerid, i_htfTF, low[3],   barmerge.gaps_off, barmerge.lookahead_on)
+
+float htfTimeRef = request.security(syminfo.tickerid, i_htfTF, time[1], barmerge.gaps_off, barmerge.lookahead_on)
+bool  newHTFBar  = ta.change(htfTimeRef) != 0
+
+var float[] htfTop      = array.new_float(0)
+var float[] htfBottom   = array.new_float(0)
+var int[]   htfDir      = array.new_int(0)
+var box[]   htfBoxArr   = array.new_box(0)
+var float[] htfActive   = array.new_float(0)
+var float[] htfTraded   = array.new_float(0)
+
+if newHTFBar
+    if htfLow3 > htfHigh
+        array.push(htfTop, htfLow3)
+        array.push(htfBottom, htfHigh)
+        array.push(htfDir, -1)
+        array.push(htfActive, 1.0)
+        array.push(htfTraded, 0.0)
+        box b = i_showHTF ? box.new(bar_index - 1, htfLow3, bar_index + 60, htfHigh,
+                     border_color=color.new(color.red, 50), bgcolor=i_bearHTF,
+                     border_width=1, border_style=line.style_dashed,
+                     text="15m ▼", text_color=color.new(color.red, 30),
+                     text_size=size.tiny, text_halign=text.align_left) : na
+        array.push(htfBoxArr, b)
+
+    if htfHigh3 < htfLow
+        array.push(htfTop, htfLow)
+        array.push(htfBottom, htfHigh3)
+        array.push(htfDir, 1)
+        array.push(htfActive, 1.0)
+        array.push(htfTraded, 0.0)
+        box b = i_showHTF ? box.new(bar_index - 1, htfLow, bar_index + 60, htfHigh3,
+                     border_color=color.new(color.teal, 50), bgcolor=i_bullHTF,
+                     border_width=1, border_style=line.style_dashed,
+                     text="15m ▲", text_color=color.new(color.teal, 30),
+                     text_size=size.tiny, text_halign=text.align_left) : na
+        array.push(htfBoxArr, b)
+
+    while array.size(htfTop) > i_maxHTF
+        array.shift(htfTop)
+        array.shift(htfBottom)
+        array.shift(htfDir)
+        array.shift(htfActive)
+        array.shift(htfTraded)
+        box oldBox = array.shift(htfBoxArr)
+        if not na(oldBox)
+            box.delete(oldBox)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4: HTF INVALIDATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+if newHTFBar and array.size(htfActive) > 0
+    for i = 0 to array.size(htfActive) - 1
+        if array.get(htfActive, i) == 1.0
+            int   d = array.get(htfDir, i)
+            float t = array.get(htfTop, i)
+            float b = array.get(htfBottom, i)
+
+            if d == -1 and htfClose > t
+                array.set(htfActive, i, 0.0)
+                box bx = array.get(htfBoxArr, i)
+                if not na(bx)
+                    box.set_border_color(bx, color.new(color.gray, 85))
+                    box.set_bgcolor(bx, color.new(color.gray, 95))
+                    box.set_text(bx, "15m ▼ (INVALID)")
+                    box.set_text_color(bx, color.gray)
+
+            if d == 1 and htfClose < b
+                array.set(htfActive, i, 0.0)
+                box bx = array.get(htfBoxArr, i)
+                if not na(bx)
+                    box.set_border_color(bx, color.new(color.gray, 85))
+                    box.set_bgcolor(bx, color.new(color.gray, 95))
+                    box.set_text(bx, "15m ▲ (INVALID)")
+                    box.set_text_color(bx, color.gray)
+
+if barstate.islast and array.size(htfBoxArr) > 0
+    for i = 0 to array.size(htfBoxArr) - 1
+        if array.get(htfActive, i) == 1.0 and array.get(htfTraded, i) == 0.0
+            box bx = array.get(htfBoxArr, i)
+            if not na(bx)
+                box.set_right(bx, bar_index + 15)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 5: ENGINE 2 — VISUAL 1-MINUTE FVG TRACKER
+// ─────────────────────────────────────────────────────────────────────────────
+// Draws the most recent 1m Bullish and Bearish FVG as colored boxes.
+// Decoupled from HTF — always tracking, always updating.
+// NOTE: Native invalidation (phantom cleanup) is in Section 8, AFTER
+// the FSM execution in Section 7, so triggers fire before cleanup.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var box   active_bull_fvg_box = na
+var float bull_fvg_top        = na
+var float bull_fvg_bot        = na
+var int   bull_fvg_bar        = na
+
+var box   active_bear_fvg_box = na
+var float bear_fvg_top        = na
+var float bear_fvg_bot        = na
+var int   bear_fvg_bar        = na
+
+// ─── 1m Bullish FVG: high[2] < low[0] ───────────────────────────────────────
+if high[2] < low[0]
+    if not na(active_bull_fvg_box)
+        box.delete(active_bull_fvg_box)
+    bull_fvg_top := low[0]
+    bull_fvg_bot := high[2]
+    bull_fvg_bar := bar_index - 2
+    active_bull_fvg_box := i_showLTF ?
+         box.new(bar_index - 2, bull_fvg_top, bar_index + 10, bull_fvg_bot,
+             border_color=color.green, bgcolor=i_bullLTF,
+             border_width=1, text="1m ▲", text_color=color.green,
+             text_size=size.tiny, text_halign=text.align_right) : na
+
+// ─── 1m Bearish FVG: low[2] > high[0] ───────────────────────────────────────
+if low[2] > high[0]
+    if not na(active_bear_fvg_box)
+        box.delete(active_bear_fvg_box)
+    bear_fvg_top := low[2]
+    bear_fvg_bot := high[0]
+    bear_fvg_bar := bar_index - 2
+    active_bear_fvg_box := i_showLTF ?
+         box.new(bar_index - 2, bear_fvg_top, bar_index + 10, bear_fvg_bot,
+             border_color=color.red, bgcolor=i_bearLTF,
+             border_width=1, text="1m ▼", text_color=color.red,
+             text_size=size.tiny, text_halign=text.align_right) : na
+
+// Extension handled at end of script (barstate.islast)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 6: FSM STEP 1 — PERSISTENT ARMED STATE (THE TAP)
+// ─────────────────────────────────────────────────────────────────────────────
+// Arms on zone tap (active + untraded zones only).
+// NO 1m close-through disarming. Price can sweep freely.
+// Disarms ONLY on: HTF zone invalidation, trade consumption, or new day.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var bool  armed_short          = false
+var bool  armed_long           = false
+var float armed_short_zone_top = na
+var float armed_short_zone_bot = na
+var float armed_long_zone_top  = na
+var float armed_long_zone_bot  = na
+var bool  has_swept_short      = false
+var bool  has_swept_long       = false
+
+if isNewDay
+    armed_short          := false
+    armed_long           := false
+    armed_short_zone_top := na
+    armed_short_zone_bot := na
+    armed_long_zone_top  := na
+    armed_long_zone_bot  := na
+    has_swept_short      := false
+    has_swept_long       := false
+
+// --- Arming: only active + untraded zones ---
+if array.size(htfActive) > 0
+    for i = 0 to array.size(htfActive) - 1
+        if array.get(htfActive, i) == 1.0 and array.get(htfTraded, i) == 0.0
+            int   d = array.get(htfDir, i)
+            float t = array.get(htfTop, i)
+            float b = array.get(htfBottom, i)
+
+            if d == -1 and high >= b and not armed_short
+                armed_short          := true
+                armed_short_zone_top := t
+                armed_short_zone_bot := b
+
+            if d == 1 and low <= t and not armed_long
+                armed_long          := true
+                armed_long_zone_top := t
+                armed_long_zone_bot := b
+
+// --- Sweep tracking ---
+if armed_short and not na(armed_short_zone_top)
+    if high > armed_short_zone_top
+        has_swept_short := true
+
+if armed_long and not na(armed_long_zone_bot)
+    if low < armed_long_zone_bot
+        has_swept_long := true
+
+// --- Disarm ONLY if backing HTF zone was destroyed ---
+if armed_short and not na(armed_short_zone_top)
+    bool zoneAlive = false
+    if array.size(htfActive) > 0
+        for i = 0 to array.size(htfActive) - 1
+            if array.get(htfActive, i) == 1.0 and array.get(htfDir, i) == -1
+                if array.get(htfTop, i) == armed_short_zone_top and array.get(htfBottom, i) == armed_short_zone_bot
+                    zoneAlive := true
+                    break
+    if not zoneAlive
+        armed_short          := false
+        armed_short_zone_top := na
+        armed_short_zone_bot := na
+        has_swept_short      := false
+
+if armed_long and not na(armed_long_zone_top)
+    bool zoneAlive = false
+    if array.size(htfActive) > 0
+        for i = 0 to array.size(htfActive) - 1
+            if array.get(htfActive, i) == 1.0 and array.get(htfDir, i) == 1
+                if array.get(htfTop, i) == armed_long_zone_top and array.get(htfBottom, i) == armed_long_zone_bot
+                    zoneAlive := true
+                    break
+    if not zoneAlive
+        armed_long          := false
+        armed_long_zone_top := na
+        armed_long_zone_bot := na
+        has_swept_long      := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 7: FSM STEP 2 — INVERSION EXECUTION + ZONE CONSUMPTION
+// ─────────────────────────────────────────────────────────────────────────────
+// v5.1 FIX: ALL consumption logic is INSIDE `if shortCondition` / `if longCondition`.
+// If canTrade is false (out of session, max trades hit, in position), the trigger
+// evaluates but consumption does NOT fire — the zone survives for later.
+//
+// This guarantees: a 15m zone is ONLY locked out (htfTraded = 1.0) when a
+// physical strategy.entry() order is actually sent to the broker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// --- Triggers (evaluate regardless of canTrade) ---
+bool shortTrigger = armed_short
+     and not na(bull_fvg_bot)
+     and close < bull_fvg_bot
+     and close < open
+     and (not i_reqSweep or has_swept_short)
+
+bool longTrigger = armed_long
+     and not na(bear_fvg_top)
+     and close > bear_fvg_top
+     and close > open
+     and (not i_reqSweep or has_swept_long)
+
+// --- Full entry conditions (trigger + trade gates) ---
+bool shortCondition = canTrade and shortTrigger
+bool longCondition  = canTrade and longTrigger
+
+// ─── SHORT EXECUTION: consume ONLY if condition is true ─────────────────────
+if shortCondition
+    // 1. Recolor the 1m bullish FVG box to purple (visual iFVG proof)
+    if not na(active_bull_fvg_box)
+        box.set_bgcolor(active_bull_fvg_box, i_invertClr)
+        box.set_border_color(active_bull_fvg_box, color.purple)
+        box.set_text(active_bull_fvg_box, "iFVG ▼")
+        box.set_text_color(active_bull_fvg_box, color.purple)
+        box.set_right(active_bull_fvg_box, bar_index)
+
+    // 2. Mark parent 15m zone as TRADED
+    if array.size(htfActive) > 0
+        for i = 0 to array.size(htfActive) - 1
+            if array.get(htfActive, i) == 1.0 and array.get(htfDir, i) == -1
+                if array.get(htfTop, i) == armed_short_zone_top and array.get(htfBottom, i) == armed_short_zone_bot
+                    array.set(htfTraded, i, 1.0)
+                    box bx = array.get(htfBoxArr, i)
+                    if not na(bx)
+                        box.set_border_color(bx, color.new(color.gray, 60))
+                        box.set_bgcolor(bx, i_tradedClr)
+                        box.set_text(bx, "15m ▼ (TRADED)")
+                        box.set_text_color(bx, color.gray)
+                    break
+
+    // 3. Consume armed state
+    armed_short          := false
+    armed_short_zone_top := na
+    armed_short_zone_bot := na
+    has_swept_short      := false
+    bull_fvg_top         := na
+    bull_fvg_bot         := na
+    bull_fvg_bar         := na
+    active_bull_fvg_box  := na  // Detach (purple box persists on chart)
+
+// ─── LONG EXECUTION: consume ONLY if condition is true ──────────────────────
+if longCondition
+    // 1. Recolor the 1m bearish FVG box to purple (visual iFVG proof)
+    if not na(active_bear_fvg_box)
+        box.set_bgcolor(active_bear_fvg_box, i_invertClr)
+        box.set_border_color(active_bear_fvg_box, color.purple)
+        box.set_text(active_bear_fvg_box, "iFVG ▲")
+        box.set_text_color(active_bear_fvg_box, color.purple)
+        box.set_right(active_bear_fvg_box, bar_index)
+
+    // 2. Mark parent 15m zone as TRADED
+    if array.size(htfActive) > 0
+        for i = 0 to array.size(htfActive) - 1
+            if array.get(htfActive, i) == 1.0 and array.get(htfDir, i) == 1
+                if array.get(htfTop, i) == armed_long_zone_top and array.get(htfBottom, i) == armed_long_zone_bot
+                    array.set(htfTraded, i, 1.0)
+                    box bx = array.get(htfBoxArr, i)
+                    if not na(bx)
+                        box.set_border_color(bx, color.new(color.gray, 60))
+                        box.set_bgcolor(bx, i_tradedClr)
+                        box.set_text(bx, "15m ▲ (TRADED)")
+                        box.set_text_color(bx, color.gray)
+                    break
+
+    // 3. Consume armed state
+    armed_long          := false
+    armed_long_zone_top := na
+    armed_long_zone_bot := na
+    has_swept_long      := false
+    bear_fvg_top        := na
+    bear_fvg_bot        := na
+    bear_fvg_bar        := na
+    active_bear_fvg_box := na  // Detach (purple box persists on chart)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 8: NATIVE 1m FVG INVALIDATION (PHANTOM CLEANUP)
+// ─────────────────────────────────────────────────────────────────────────────
+// CRITICAL: This runs AFTER Section 7. The FSM has already had its chance to
+// fire a trade from the inversion. Now we clean up any 1m FVG that was filled
+// naturally (price closed through it) WITHOUT triggering a trade.
+//
+// A 1m Bullish FVG is dead if close < bull_fvg_bot (inverted without a trade).
+// A 1m Bearish FVG is dead if close > bear_fvg_top (inverted without a trade).
+//
+// These are "phantom" FVGs — they look valid in the tracker but the gap has
+// already been filled by natural price action. If not cleared, they cause
+// false triggers on future bars when the armed state catches up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Clean up bull FVG phantom: price closed below its bottom (filled/inverted natively)
+if not na(bull_fvg_bot) and close < bull_fvg_bot
+    if not na(active_bull_fvg_box)
+        box.set_bgcolor(active_bull_fvg_box, i_filledClr)
+        box.set_border_color(active_bull_fvg_box, color.gray)
+        box.set_text(active_bull_fvg_box, "1m ▲ (FILLED)")
+        box.set_text_color(active_bull_fvg_box, color.gray)
+    bull_fvg_top        := na
+    bull_fvg_bot        := na
+    bull_fvg_bar        := na
+    active_bull_fvg_box := na  // Detach (gray box persists)
+
+// Clean up bear FVG phantom: price closed above its top (filled/inverted natively)
+if not na(bear_fvg_top) and close > bear_fvg_top
+    if not na(active_bear_fvg_box)
+        box.set_bgcolor(active_bear_fvg_box, i_filledClr)
+        box.set_border_color(active_bear_fvg_box, color.gray)
+        box.set_text(active_bear_fvg_box, "1m ▼ (FILLED)")
+        box.set_text_color(active_bear_fvg_box, color.gray)
+    bear_fvg_top        := na
+    bear_fvg_bot        := na
+    bear_fvg_bar        := na
+    active_bear_fvg_box := na  // Detach (gray box persists)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 9: TRADE MANAGEMENT — GERTI SL/TP SYSTEM
+// ─────────────────────────────────────────────────────────────────────────────
+// Gerti SL: Above the absolute peak (shorts) or below the absolute valley
+// (longs) of the liquidity sweep / pullback leg that tapped the 15m zone.
+//
+//   Shorts: SL = ta.highest(high, lookback) + (minSLTicks × mintick)
+//   Longs:  SL = ta.lowest(low, lookback)  - (minSLTicks × mintick)
+//
+// The buffer (i_minSLTicks) serves double duty:
+//   1. Adds breathing room beyond the swing extreme
+//   2. Guarantees a non-zero SL distance even if the inversion candle IS
+//      the highest/lowest bar in the lookback window
+//
+// Gerti TP: Entry ± (SL_distance × R:R ratio)
+// ─────────────────────────────────────────────────────────────────────────────
+
+float swingHigh = ta.highest(high, i_slLookback)
+float swingLow  = ta.lowest(low, i_slLookback)
+float slBuffer  = i_minSLTicks * syminfo.mintick
+
+if shortCondition
+    float entryPrice = close
+    float sl         = swingHigh + slBuffer
+    float slDist     = math.abs(sl - entryPrice)
+    float tp         = entryPrice - (slDist * i_rrRatio)
+
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    dailyTradeCount += 1
+
+    if i_showSLTP
+        label.new(bar_index, sl, "SL " + str.tostring(sl, format.mintick),
+             color=color.new(color.red, 40), textcolor=color.white,
+             style=label.style_label_down, size=size.tiny)
+        label.new(bar_index, tp, "TP " + str.tostring(tp, format.mintick),
+             color=color.new(color.green, 40), textcolor=color.white,
+             style=label.style_label_up, size=size.tiny)
+        label.new(bar_index, entryPrice, "ENTRY " + str.tostring(entryPrice, format.mintick),
+             color=color.new(color.orange, 40), textcolor=color.white,
+             style=label.style_label_left, size=size.tiny)
+
+if longCondition
+    float entryPrice = close
+    float sl         = swingLow - slBuffer
+    float slDist     = math.abs(entryPrice - sl)
+    float tp         = entryPrice + (slDist * i_rrRatio)
+
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    dailyTradeCount += 1
+
+    if i_showSLTP
+        label.new(bar_index, sl, "SL " + str.tostring(sl, format.mintick),
+             color=color.new(color.red, 40), textcolor=color.white,
+             style=label.style_label_up, size=size.tiny)
+        label.new(bar_index, tp, "TP " + str.tostring(tp, format.mintick),
+             color=color.new(color.green, 40), textcolor=color.white,
+             style=label.style_label_down, size=size.tiny)
+        label.new(bar_index, entryPrice, "ENTRY " + str.tostring(entryPrice, format.mintick),
+             color=color.new(color.orange, 40), textcolor=color.white,
+             style=label.style_label_left, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 10: VISUAL OVERLAYS
+// ─────────────────────────────────────────────────────────────────────────────
+
+plotshape(i_showSigs and shortCondition ? high : na,
+     title="Bearish iFVG Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.red,
+     size=size.small, text="SHORT")
+
+plotshape(i_showSigs and longCondition ? low : na,
+     title="Bullish iFVG Entry", style=shape.triangleup,
+     location=location.belowbar, color=color.teal,
+     size=size.small, text="LONG")
+
+// Armed state background
+color armBg = armed_short and armed_long ? color.new(#FFD700, 92) :
+              armed_short ? color.new(color.orange, 94) :
+              armed_long  ? color.new(#9C27B0, 94) : na
+bgcolor(i_showArm ? armBg : na, title="Armed State Background")
+
+// Sweep confirmed dots
+plotshape(i_showArm and has_swept_short and armed_short ? high : na,
+     title="Short Sweep Confirmed", style=shape.circle,
+     location=location.abovebar, color=color.new(color.yellow, 40),
+     size=size.tiny)
+plotshape(i_showArm and has_swept_long and armed_long ? low : na,
+     title="Long Sweep Confirmed", style=shape.circle,
+     location=location.belowbar, color=color.new(color.yellow, 40),
+     size=size.tiny)
+
+// Session background
+bgcolor(inSession ? color.new(color.blue, 97) : na, title="Session Window")
+
+// Extend active 1m FVG boxes on last bar
+if barstate.islast
+    if not na(active_bull_fvg_box) and not na(bull_fvg_bot)
+        box.set_right(active_bull_fvg_box, bar_index + 5)
+    if not na(active_bear_fvg_box) and not na(bear_fvg_top)
+        box.set_right(active_bear_fvg_box, bar_index + 5)
+
+// Data Window diagnostics
+plot(armed_short ? 1 : 0, "Armed Short",       display=display.data_window, color=color.orange)
+plot(armed_long  ? 1 : 0, "Armed Long",        display=display.data_window, color=color.purple)
+plot(has_swept_short ? 1 : 0, "Swept Short",   display=display.data_window, color=color.yellow)
+plot(has_swept_long  ? 1 : 0, "Swept Long",    display=display.data_window, color=color.yellow)
+plot(not na(bull_fvg_bot) ? bull_fvg_bot : na,
+     "1m Bull FVG Bot (Short Trigger)",         display=display.data_window, color=color.green)
+plot(not na(bear_fvg_top) ? bear_fvg_top : na,
+     "1m Bear FVG Top (Long Trigger)",          display=display.data_window, color=color.red)
+plot(dailyTradeCount, "Daily Trades",           display=display.data_window, color=color.gray)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 11: ALERTS (Webhook-Compatible)
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(shortCondition,
+     title="iFVG Short Entry",
+     message='{"action":"sell","ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}"}')
+
+alertcondition(longCondition,
+     title="iFVG Long Entry",
+     message='{"action":"buy","ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}"}')
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END OF SCRIPT — ICT iFVG CONTINUATION ENGINE v5.1
+// ═══════════════════════════════════════════════════════════════════════════════
